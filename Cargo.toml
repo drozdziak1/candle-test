@@ -4,3 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.98"
+candle-core = { version = "0.8.4", features = ["cuda", "cudarc", "cudnn"] }

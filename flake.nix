@@ -18,6 +18,7 @@
         ];
         config = {
           allowUnfree = true;
+          cudaSupport = true;
         };
       };
       in
@@ -25,11 +26,15 @@
       devShell = pkgs.mkShell rec {
         nativeBuildInputs = with pkgs;[
           cudatoolkit
-          cudaPackages.cuda_cudart
+          cudaPackages.cuda_cudart.dev
+          cudaPackages.cudnn.dev
           pkg-config
           rust-bin.stable."1.86.0".default
         ];
-        LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath nativeBuildInputs;
+        CUDA_TOOLKIT_ROOT_DIR=pkgs.cudatoolkit.out;
+        CUDNN_LIB=pkgs.cudaPackages.cudnn.dev;
+        LD_LIBRARY_PATH = "${pkgs.addDriverRunpath.driverLink}/lib:${pkgs.lib.makeLibraryPath nativeBuildInputs}";
+        INCLUDE_PATH = pkgs.lib.makeIncludePath nativeBuildInputs;
       };
   });
 }
