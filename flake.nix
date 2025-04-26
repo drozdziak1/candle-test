@@ -30,6 +30,7 @@
           cudaPackages.cudnn.dev
           pkg-config
           rust-bin.stable."1.86.0".default
+          rust-analyzer
         ];
         CUDA_TOOLKIT_ROOT_DIR=pkgs.cudatoolkit.out;
         CUDNN_LIB=pkgs.cudaPackages.cudnn.dev;
