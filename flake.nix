@@ -29,6 +29,7 @@
           cudaPackages.cuda_cudart.dev
           cudaPackages.cudnn.dev
           pkg-config
+          cargo-watch
           rust-bin.stable."1.86.0".default
           rust-analyzer
         ];
