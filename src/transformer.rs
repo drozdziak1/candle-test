@@ -7,8 +7,6 @@ use candle_nn::{
 
 pub const FLOAT_DTYPE: DType = DType::F16;
 
-pub const INT_DTYPE: DType = DType::U32;
-
 #[derive(Clone, Debug)]
 pub struct TransformerConfig {
     pub vocab_size: usize,
@@ -26,7 +24,7 @@ pub struct Transformer {
 }
 
 impl Transformer {
-    fn new(cfg: &TransformerConfig, vb: VarBuilder, dev: &Device) -> Result<Self> {
+    pub fn new(cfg: &TransformerConfig, vb: VarBuilder, dev: &Device) -> Result<Self> {
         let mut blocks = nn::seq();
 
         for i in 0..cfg.num_blocks {
@@ -149,6 +147,9 @@ mod test {
     use candle_nn::VarMap;
 
     use super::*;
+
+    pub const INT_DTYPE: DType = DType::U32;
+
 
     #[test]
     fn test_transformer_happy_path() -> Result<()> {
