@@ -1,7 +1,7 @@
 //! Numerical stability helpers
 
 use candle_core::{DType, Result, Tensor, bail};
-use log::trace;
+use log::{trace, debug};
 
 pub fn check_nan_and_inf(t: &Tensor, comment: &str) -> Result<()> {
     // inf unchanged by small mul + add
@@ -19,19 +19,17 @@ pub fn check_nan_and_inf(t: &Tensor, comment: &str) -> Result<()> {
         .sum_all()?
         .to_scalar::<u32>()?;
 
+    trace!("Tensor {:?}:\n{}", comment, t);
     if nan_check > 0 || inf_check > 0 {
-        let maybe_comment = if !comment.is_empty() {
-            format!("{}: ", comment)
-        } else {
-            String::new()
-        };
-	trace!("Tensor:\n{}", t);
+	debug!("{:?}: fuggg :-------DDDDD", comment);
         bail!(
-            "{}NaNs and/or infs detected - inf: {}, nan: {}",
-            maybe_comment,
+            "{:?}: NaNs and/or infs detected - inf: {}, nan: {}",
+            comment,
             inf_check,
             nan_check
         );
+    } else {
+	debug!("{:?}: OK", comment);
     }
 
     Ok(())

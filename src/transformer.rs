@@ -7,6 +7,8 @@ use candle_nn::{
     self as nn, Embedding, LayerNorm, LayerNormConfig, Linear, Module, Sequential, VarBuilder,
 };
 
+use crate::num_helpers::check_nan_and_inf;
+
 pub const FLOAT_DTYPE: DType = DType::BF16;
 pub const INT_DTYPE: DType = DType::U32;
 
@@ -35,10 +37,19 @@ impl Transformer {
         for i in 0..cfg.num_blocks {
             blocks = blocks.add(TBlock::new(cfg, vb.pp(format!("block{}", i)), dev)?);
         }
+	let w_embed_unembed = vb.get_with_hints(
+		(cfg.vocab_size, cfg.embed_dim),
+		"w_embed_unembed",
+		nn::init::DEFAULT_KAIMING_UNIFORM,
+	    )?;
+
+	let embed = Embedding::new(w_embed_unembed, cfg.embed_dim);
+
+	check_nan_and_inf(embed.embeddings(), "embed init")?;
 
         Ok(Self {
             config: cfg.clone(),
-            embed: nn::embedding(cfg.vocab_size, cfg.embed_dim, vb.pp("embed_unembed"))?,
+            embed,
             pos_embed: vb.get_with_hints(
                 (cfg.ctx_size, cfg.embed_dim),
                 "pos_embed",
@@ -53,19 +64,23 @@ impl Module for Transformer {
     fn forward(&self, xs: &Tensor) -> Result<Tensor, candle_core::Error> {
         let x_embed = self.embed.forward(xs)?;
 
+	check_nan_and_inf(&x_embed, "model x_embed")?;
+
         let x_pos_embed = x_embed.add(&self.pos_embed.expand(x_embed.shape())?)?;
+
+	check_nan_and_inf(&x_pos_embed, "model x_pos_embed")?;
 
         let x_blocks = self.blocks.forward(&x_pos_embed)?;
 
+	check_nan_and_inf(&x_blocks, "model x_blocks")?;
+
         let x_unembed = x_blocks.broadcast_matmul(&self.embed.embeddings().t()?)?;
+
+	check_nan_and_inf(&x_unembed, "model x_unembed")?;
 
         let x_out = nn::ops::softmax(&x_unembed, D::Minus1)?;
 
-        let nan_or_inf = x_out.affine(2.0, 1.0)?.eq(&x_out)?.sum_all()?;
-
-        if nan_or_inf.to_scalar::<u8>()? > 0 {
-            candle_core::bail!("x_out has nans or inf");
-        }
+	check_nan_and_inf(&x_out, "model x_out")?;
 
         Ok(x_out)
     }
@@ -96,14 +111,23 @@ impl TBlock {
 impl Module for TBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor, candle_core::Error> {
         let x_ln1 = self.ln1.forward(xs)?;
+	check_nan_and_inf(&x_ln1, "x_ln1")?;
 
         let x_atn = self.atn.forward(&x_ln1)?;
+	check_nan_and_inf(&x_atn, "x_atn")?;
 
         let xs_with_atn = (xs + x_atn)?;
+	check_nan_and_inf(&xs_with_atn, "xs_with_atn")?;
 
         let x_ln2 = self.ln2.forward(&xs_with_atn)?;
+	check_nan_and_inf(&x_ln2, "x_ln2")?;
+
         let x_ff1 = self.ff1.forward(&x_ln2)?.gelu()?;
+	check_nan_and_inf(&x_ff1, "x_ff1")?;
+
         let x_ff2 = self.ff2.forward(&x_ff1)?;
+	check_nan_and_inf(&x_ff2, "x_ff2")?;
+
 
         Ok((xs_with_atn + x_ff2)?)
     }
