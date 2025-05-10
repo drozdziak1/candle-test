@@ -1,26 +1,31 @@
-use anyhow::{Result, anyhow};
-use candle_core::{DType, Device, Tensor};
+use core::f64;
+
+use anyhow::{Result, anyhow, bail};
+use candle_core::{D, DType, Device, Tensor};
 use candle_flash_attn::flash_attn;
 use candle_nn::{
     self as nn, Embedding, LayerNorm, LayerNormConfig, Linear, Module, Sequential, VarBuilder,
 };
 
-pub const FLOAT_DTYPE: DType = DType::F16;
+pub const FLOAT_DTYPE: DType = DType::BF16;
+pub const INT_DTYPE: DType = DType::U32;
 
 #[derive(Clone, Debug)]
 pub struct TransformerConfig {
+    pub ctx_size: usize,
     pub vocab_size: usize,
     pub embed_dim: usize,
     pub num_heads: usize,
     pub num_blocks: usize,
     pub ff_dim: usize,
+    pub is_causal: bool,
 }
 
 pub struct Transformer {
     pub config: TransformerConfig,
     pub embed: Embedding,
+    pub pos_embed: Tensor,
     pub blocks: Sequential,
-    pub unembed: Tensor,
 }
 
 impl Transformer {
@@ -33,38 +38,43 @@ impl Transformer {
 
         Ok(Self {
             config: cfg.clone(),
-            embed: nn::embedding(cfg.vocab_size, cfg.embed_dim, vb.pp("embed"))?,
-            blocks,
-            unembed: vb.get_with_hints_dtype(
-                (cfg.embed_dim, cfg.vocab_size),
-                "unembed",
-                nn::init::DEFAULT_KAIMING_NORMAL,
-                FLOAT_DTYPE,
+            embed: nn::embedding(cfg.vocab_size, cfg.embed_dim, vb.pp("embed_unembed"))?,
+            pos_embed: vb.get_with_hints(
+                (cfg.ctx_size, cfg.embed_dim),
+                "pos_embed",
+                nn::init::DEFAULT_KAIMING_UNIFORM,
             )?,
+            blocks,
         })
     }
 }
 
 impl Module for Transformer {
     fn forward(&self, xs: &Tensor) -> Result<Tensor, candle_core::Error> {
+        let x_embed = self.embed.forward(xs)?;
 
-	let x_embed = self.embed.forward(xs)?;
+        let x_pos_embed = x_embed.add(&self.pos_embed.expand(x_embed.shape())?)?;
 
-	let x_blocks = self.blocks.forward(&x_embed)?;
+        let x_blocks = self.blocks.forward(&x_pos_embed)?;
 
-	let x_unembed = x_blocks.broadcast_matmul(&self.unembed)?;
-	
-	Ok(x_unembed)
+        let x_unembed = x_blocks.broadcast_matmul(&self.embed.embeddings().t()?)?;
+
+        let x_out = nn::ops::softmax(&x_unembed, D::Minus1)?;
+
+        let nan_or_inf = x_out.affine(2.0, 1.0)?.eq(&x_out)?.sum_all()?;
+
+        if nan_or_inf.to_scalar::<u8>()? > 0 {
+            candle_core::bail!("x_out has nans or inf");
+        }
+
+        Ok(x_out)
     }
 }
 
 pub struct TBlock {
     config: TransformerConfig,
-    head_size: usize,
     ln1: LayerNorm,
-    w_q: Tensor,
-    w_k: Tensor,
-    w_v: Tensor,
+    atn: MHSA,
     ln2: LayerNorm,
     ff1: Linear,
     ff2: Linear,
@@ -72,40 +82,10 @@ pub struct TBlock {
 
 impl TBlock {
     pub fn new(cfg: &TransformerConfig, vb: VarBuilder, dev: &Device) -> Result<Self> {
-        if cfg.embed_dim % cfg.num_heads != 0 {
-            return Err(anyhow!(
-                "num_heads must divide embed_dim evenly ({} % {} = {})",
-                cfg.embed_dim,
-                cfg.num_heads,
-                cfg.embed_dim % cfg.num_heads
-            ));
-        }
-        let w_q = vb.get_with_hints_dtype(
-            (cfg.embed_dim, cfg.embed_dim),
-            "w_q",
-            nn::init::DEFAULT_KAIMING_NORMAL,
-            FLOAT_DTYPE,
-        )?;
-        let w_k = vb.get_with_hints_dtype(
-            (cfg.embed_dim, cfg.embed_dim),
-            "w_k",
-            nn::init::DEFAULT_KAIMING_NORMAL,
-            FLOAT_DTYPE,
-        )?;
-        let w_v = vb.get_with_hints_dtype(
-            (cfg.embed_dim, cfg.embed_dim),
-            "w_v",
-            nn::init::DEFAULT_KAIMING_NORMAL,
-            FLOAT_DTYPE,
-        )?;
-
         Ok(Self {
             config: cfg.clone(),
-            head_size: cfg.embed_dim / cfg.num_heads,
             ln1: nn::layer_norm(cfg.embed_dim, LayerNormConfig::default(), vb.pp("ln1"))?,
-            w_q,
-            w_k,
-            w_v,
+            atn: MHSA::new(cfg, vb.pp("atn"), dev)?,
             ln2: nn::layer_norm(cfg.embed_dim, LayerNormConfig::default(), vb.pp("ln2"))?,
             ff1: nn::linear(cfg.embed_dim, cfg.ff_dim, vb.pp("ff1"))?,
             ff2: nn::linear(cfg.ff_dim, cfg.embed_dim, vb.pp("ff2"))?,
@@ -115,21 +95,9 @@ impl TBlock {
 
 impl Module for TBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor, candle_core::Error> {
-        let x_shape = xs.shape().dims();
         let x_ln1 = self.ln1.forward(xs)?;
 
-        let qkv_shape = (
-            x_shape[0],
-            x_shape[1],
-            self.config.num_heads,
-            self.head_size,
-        );
-
-        let q = x_ln1.broadcast_matmul(&self.w_q)?.reshape(qkv_shape)?;
-        let k = x_ln1.broadcast_matmul(&self.w_k)?.reshape(qkv_shape)?;
-        let v = x_ln1.broadcast_matmul(&self.w_v)?.reshape(qkv_shape)?;
-
-        let x_atn = flash_attn(&q, &k, &v, 1.0, true)?.reshape(x_shape)?;
+        let x_atn = self.atn.forward(&x_ln1)?;
 
         let xs_with_atn = (xs + x_atn)?;
 
@@ -141,6 +109,99 @@ impl Module for TBlock {
     }
 }
 
+pub struct MHSA {
+    config: TransformerConfig,
+    head_size: usize,
+    mask: Tensor,
+    w_qkv: Linear,
+    w_atn_out: Linear,
+}
+
+impl MHSA {
+    pub fn new(cfg: &TransformerConfig, vb: VarBuilder, dev: &Device) -> Result<Self> {
+        if cfg.embed_dim % cfg.num_heads != 0 {
+            return Err(anyhow!(
+                "num_heads must divide embed_dim evenly ({} % {} = {})",
+                cfg.embed_dim,
+                cfg.num_heads,
+                cfg.embed_dim % cfg.num_heads
+            ));
+        }
+
+        let zeros = Tensor::zeros((cfg.ctx_size, cfg.ctx_size), FLOAT_DTYPE, dev)?;
+
+        let mask = if cfg.is_causal {
+            let infinities = Tensor::full(f64::NEG_INFINITY, zeros.shape(), dev)?.to_dtype(FLOAT_DTYPE)?;
+
+            Tensor::tril2(cfg.ctx_size, INT_DTYPE, dev)?
+                .where_cond(&infinities, &zeros)?
+                .to_dtype(FLOAT_DTYPE)?
+        } else {
+            zeros
+        };
+
+        Ok(Self {
+            config: cfg.clone(),
+            head_size: cfg.embed_dim / cfg.num_heads,
+            mask,
+            w_qkv: nn::linear(cfg.embed_dim, cfg.embed_dim * 3, vb.pp("w_qkv"))?,
+            w_atn_out: nn::linear(cfg.embed_dim, cfg.embed_dim, vb.pp("w_atn_out"))?,
+        })
+    }
+}
+
+impl Module for MHSA {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor, candle_core::Error> {
+        let xs_shape = xs.shape().dims();
+
+        let x_qkv_chunks = self.w_qkv.forward(xs)?.chunk(3, D::Minus1)?;
+
+        let x_q = x_qkv_chunks[0]
+            .reshape((
+                xs_shape[0],
+                xs_shape[1],
+                self.config.num_heads,
+                self.head_size,
+            ))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let x_k = x_qkv_chunks[1]
+            .reshape((
+                xs_shape[0],
+                xs_shape[1],
+                self.config.num_heads,
+                self.head_size,
+            ))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let x_v = x_qkv_chunks[2]
+            .reshape((
+                xs_shape[0],
+                xs_shape[1],
+                self.config.num_heads,
+                self.head_size,
+            ))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let xqxk = x_q.matmul(&x_k.t()?)?;
+
+        let xqxk_masked = xqxk.broadcast_add(&self.mask)?;
+
+        let xqxk_scaled = xqxk_masked.affine(1.0 / (self.head_size as f64).sqrt(), 0.0)?;
+
+        let x_atn = nn::ops::softmax_last_dim(&xqxk_scaled)?.matmul(&x_v)?;
+
+        let x_atn_reshaped = x_atn.transpose(1, 2)?.reshape(xs_shape)?;
+
+        let x_out = self.w_atn_out.forward(&x_atn_reshaped)?;
+
+        Ok(x_out)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use candle_core::DType;
@@ -148,42 +209,44 @@ mod test {
 
     use super::*;
 
-    pub const INT_DTYPE: DType = DType::U32;
-
-
     #[test]
     fn test_transformer_happy_path() -> Result<()> {
         let cfg = TransformerConfig {
+            ctx_size: 32,
             vocab_size: 16,
             embed_dim: 64,
             num_heads: 4,
             num_blocks: 4,
             ff_dim: 96,
+            is_causal: true,
         };
 
-	let device = Device::new_cuda(0)?;
+        let device = Device::new_cuda(0)?;
 
-	let varmap = VarMap::new();
+        let varmap = VarMap::new();
 
-	let vb = VarBuilder::from_varmap(&varmap, FLOAT_DTYPE, &device);
+        let vb = VarBuilder::from_varmap(&varmap, FLOAT_DTYPE, &device);
 
-	let model = Transformer::new(&cfg, vb, &device)?; 
+        let model = Transformer::new(&cfg, vb, &device)?;
 
-	let input = Tensor::rand(0f32, cfg.vocab_size as f32, (10, 16), &device)?.to_dtype(INT_DTYPE)?;
+        let input =
+            Tensor::rand(0f32, cfg.vocab_size as f32, (10, 16), &device)?.to_dtype(INT_DTYPE)?;
 
-	let _output = model.forward(&input)?;
+        let _output = model.forward(&input)?;
 
-	Ok(())
+        Ok(())
     }
 
     #[test]
     fn test_tblock_happy_path() -> Result<()> {
         let cfg = TransformerConfig {
+            ctx_size: 32,
             vocab_size: 16,
             embed_dim: 64,
             num_heads: 4,
             num_blocks: 4,
             ff_dim: 96,
+            is_causal: true,
         };
 
         let dev = Device::new_cuda(0)?;
@@ -193,10 +256,37 @@ mod test {
 
         let model = TBlock::new(&cfg, vs, &dev)?;
 
-        let input =
-            Tensor::rand(0.0f32, 10.0f32, (10, 16, cfg.embed_dim), &dev)?.to_dtype(DType::F16)?;
+        let input = Tensor::rand(0.0f32, 10.0f32, (10, cfg.ctx_size, cfg.embed_dim), &dev)?
+            .to_dtype(DType::F16)?;
 
-        let output = model.forward(&input)?;
+        let _output = model.forward(&input)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_mhsa_happy_path() -> Result<()> {
+        let cfg = TransformerConfig {
+            ctx_size: 32,
+            vocab_size: 16,
+            embed_dim: 64,
+            num_heads: 4,
+            num_blocks: 4,
+            ff_dim: 96,
+            is_causal: true,
+        };
+
+        let dev = Device::new_cuda(0)?;
+
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, DType::F16, &dev);
+
+        let model = MHSA::new(&cfg, vs, &dev)?;
+
+        let input = Tensor::rand(0.0f32, 10.0f32, (10, cfg.ctx_size, cfg.embed_dim), &dev)?
+            .to_dtype(DType::F16)?;
+
+        let _output = model.forward(&input)?;
 
         Ok(())
     }

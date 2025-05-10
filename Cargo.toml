@@ -9,6 +9,9 @@ candle-core = { version = "0.9.0", features = ["cuda", "cudarc", "cudnn"] }
 candle-flash-attn = { version = "0.9.0", features = ["cudnn"] }
 candle-nn = { version = "0.9.0", features = ["cuda"] }
 clap = { version = "4.5.37", features = ["derive"] }
+env_logger = "0.11.8"
+half = "2.6.0"
 hf-hub = "0.4.2"
+log = "0.4.27"
 polars = { version = "0.46.0", features = ["lazy", "parquet", "random"] }
 tokenizers = { version = "0.21.1", features = ["http"] }
