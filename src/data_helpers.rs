@@ -140,11 +140,12 @@ impl<'a> BatchIter<'a> {
 
 impl<'a> Iterator for BatchIter<'a> {
     // Tensor::from_vec() expects flat vecs
-    type Item = Vec<u32>;
+    type Item = Vec<Vec<u32>>;
     fn next(&mut self) -> Option<Self::Item> {
-        let mut flat_batch = Vec::with_capacity(self.batch_size * self.mbatch_size * self.sample_size);
-        for mb_bufs in self.buffers.iter_mut() {
-            for buf in mb_bufs.iter_mut() {
+        let mut flat_mbatches = vec![Vec::with_capacity(self.mbatch_size * self.sample_size); self.batch_size];
+
+        for (mbatch_bufs, flat_mbatch) in self.buffers.iter_mut().zip(flat_mbatches.iter_mut()) {
+            for buf in mbatch_bufs.iter_mut() {
                 // Ensure there is enough tokens in current buffer
                 while buf.len() < self.sample_size {
                     let new_chunk_txt = self.multi_parquet_iter.next()?;
@@ -163,12 +164,12 @@ impl<'a> Iterator for BatchIter<'a> {
                 // Use first self.sample_size buffer tokens to fill the current minibatch item
                 let (new_batch_item, new_buf) = buf.split_at(self.sample_size);
 
-                flat_batch.extend_from_slice(new_batch_item);
+                flat_mbatch.extend_from_slice(new_batch_item);
 
                 *buf = new_buf.to_vec();
             }
         }
 
-        Some(flat_batch)
+        Some(flat_mbatches)
     }
 }

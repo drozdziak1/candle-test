@@ -3,6 +3,7 @@
 use candle_core::{DType, Result, Tensor, bail};
 use log::{trace, debug};
 
+#[cfg(feature = "check_num_stability")]
 pub fn check_nan_and_inf(t: &Tensor, comment: &str) -> Result<()> {
     // inf unchanged by small mul + add
     let inf_check = t
@@ -35,6 +36,11 @@ pub fn check_nan_and_inf(t: &Tensor, comment: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "check_num_stability"))]
+pub fn check_nan_and_inf(_t: &Tensor, _comment: &str) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 pub mod test {
     use core::f32;
@@ -43,6 +49,7 @@ pub mod test {
 
     use super::*;
 
+    #[cfg(feature = "check_num_stability")]
     #[test]
     pub fn test_check_nan_and_inf_detects_inf() -> Result<()> {
 	let t = Tensor::full(f32::INFINITY, (1,), &Device::Cpu)?;
@@ -52,6 +59,7 @@ pub mod test {
 	Ok(())
     }
 
+    #[cfg(feature = "check_num_stability")]
     #[test]
     pub fn test_check_nan_and_inf_detects_neg_inf() -> Result<()> {
 	let t = Tensor::full(f32::NEG_INFINITY, (1,), &Device::Cpu)?;
@@ -61,6 +69,7 @@ pub mod test {
 	Ok(())
     }
 
+    #[cfg(feature = "check_num_stability")]
     #[test]
     pub fn test_check_nan_and_inf_detects_nan() -> Result<()> {
 	let t = Tensor::full(f32::NAN, (1,), &Device::Cpu)?;

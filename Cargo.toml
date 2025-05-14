@@ -15,3 +15,7 @@ hf-hub = "0.4.2"
 log = "0.4.27"
 polars = { version = "0.46.0", features = ["lazy", "parquet", "random"] }
 tokenizers = { version = "0.21.1", features = ["http"] }
+
+[features]
+default = []
+check_num_stability = []

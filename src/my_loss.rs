@@ -34,11 +34,6 @@ pub fn nll(inp: &Tensor, target: &Tensor, eps: f64) -> Result<Tensor> {
 
     check_nan_and_inf(&gathered, "gathered")?;
 
-    dbg!(&inp);
-    dbg!(&target);
-    dbg!(&gathered.flatten_all()?.max(0));
-    dbg!(&gathered.flatten_all()?.min(0));
-
     let summed = gathered.sum_all()?;
 
     check_nan_and_inf(&summed, "summed")?;

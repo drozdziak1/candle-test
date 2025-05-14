@@ -1,10 +1,11 @@
 mod data_helpers;
 mod my_loss;
+mod my_ops;
 mod num_helpers;
 mod transformer;
 
 use anyhow::{Result, anyhow, bail};
-use candle_core::{D, DType, Device, IndexOp, Tensor, shape::Dim};
+use candle_core::{backprop::GradStore, shape::Dim, DType, Device, IndexOp, Tensor, D};
 use candle_nn::{self as nn, AdamW, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use clap::Parser;
 use hf_hub::api::sync::{Api, ApiRepo};
@@ -12,6 +13,7 @@ use log::{LevelFilter, info};
 use polars::prelude::*;
 use tokenizers::Tokenizer;
 
+use core::f64;
 use std::{collections::BTreeSet, path::PathBuf};
 
 use data_helpers::{BatchIter, MultiParquetIter};
@@ -32,9 +34,9 @@ pub fn load_dataset(rng_seed: u64) -> Result<MultiParquetIter> {
 #[derive(Parser)]
 #[command(version, about)]
 pub struct Cli {
-    #[arg(short, long, default_value_t = 128)]
+    #[arg(short, long, default_value_t = 1)]
     batch_size: usize,
-    #[arg(short, long, default_value_t = 4)]
+    #[arg(short, long, default_value_t = 10)]
     minibatch_size: usize,
     #[arg(short, long, default_value_t = 1024)]
     ctx_size: usize,
@@ -43,6 +45,15 @@ pub struct Cli {
     #[arg(short, long, default_value_t = 600_000)]
     n_training_steps: usize,
 
+    #[arg(long, default_value_t = 6e-4)]
+    max_lr: f64,
+
+    #[arg(long, default_value_t = 6e-5)]
+    min_lr: f64,
+
+    #[arg(long, default_value_t = 2_000)]
+    warmup_rounds: usize,
+
     #[arg(short, long, default_value_t = 1e-5)]
     epsilon: f64,
 
@@ -50,44 +61,86 @@ pub struct Cli {
     rng_seed: u64,
 }
 
+pub fn get_lr(iter: usize, cli: &Cli) -> f64 {
+    match iter {
+	n if n < cli.warmup_rounds => cli.max_lr * (n + 1) as f64 / (cli.warmup_rounds + 1) as f64,
+	n if n > cli.n_training_steps => cli.min_lr,
+	other => {
+	    let decay_ratio = (other - cli.warmup_rounds) as f64 / (cli.n_training_steps - cli.warmup_rounds) as f64;
+	    let coeff = 0.5f64 * (1.0 + (f64::consts::PI * decay_ratio).cos());
+
+	    cli.min_lr + coeff * (cli.max_lr - cli.min_lr)
+	}
+    }
+}
+
 pub fn t_v_step(
     model: &Transformer,
-    minibatch: &Tensor,
-    eps: f64,
+    batch: &[Vec<u32>],
+    cli: &Cli,
 ) -> Result<(Tensor, Tensor, BTreeSet<u32>)> {
-    let last_dim_len = minibatch
-        .shape()
-        .dims()
-        .last()
-        .expect("INTERNAL: There must be at least one dimension in X shape")
-        .clone();
+    let mut total_loss = Tensor::zeros((), FLOAT_DTYPE, model.embed.embeddings().device())?;
 
-    let x = minibatch.i((.., ..last_dim_len - 1))?;
-    let y_gt = minibatch.i((.., 1..))?;
-
-    let y_hat = model.forward(&x)?;
-
-    let loss = my_loss::cross_entropy(
-        &y_hat.reshape(((), model.config.vocab_size))?,
-        &y_gt.flatten_all()?,
-	eps,
+    let mut total_acc_scores = Tensor::zeros(
+        (cli.minibatch_size, cli.ctx_size),
+        INT_DTYPE,
+        model.embed.embeddings().device(),
     )?;
+    let mut total_acc_hits_by_id = BTreeSet::new();
 
-    let acc_scores = y_hat.argmax(D::Minus1)?.eq(&y_gt)?.to_dtype(INT_DTYPE)?;
+    for mbatch in batch {
+        let mbatch_tensor = Tensor::from_slice(
+            mbatch.as_slice(),
+            (cli.minibatch_size, cli.ctx_size + 1),
+            model.embed.embeddings().device(),
+        )?;
 
-    let misses = Tensor::zeros_like(&y_gt)?.affine(0.0, (model.config.vocab_size + 1) as f64)?;
+        let last_dim_len = mbatch_tensor
+            .shape()
+            .dims()
+            .last()
+            .expect("INTERNAL: There must be at least one dimension in X shape")
+            .clone();
 
-    let mut acc_hits_by_id: BTreeSet<u32> = acc_scores
-        .where_cond(&y_gt, &misses)?
-        .to_dtype(INT_DTYPE)?
-        .flatten_all()?
-        .to_vec1()?
-        .into_iter()
-        .collect();
+        let x = mbatch_tensor.i((.., ..last_dim_len - 1))?;
+        let y_gt = mbatch_tensor.i((.., 1..))?;
 
-    acc_hits_by_id.remove(&(model.config.vocab_size as u32 + 1));
+        let y_hat = model.forward(&x)?;
 
-    Ok((loss.to_dtype(DType::F32)?, acc_scores.to_dtype(DType::F32)?, acc_hits_by_id))
+        let loss = my_loss::cross_entropy(
+            &y_hat.reshape(((), model.config.vocab_size))?,
+            &y_gt.flatten_all()?,
+            cli.epsilon,
+        )?.affine(1.0 / batch.len() as f64, 0.0)?;
+
+
+        let acc_scores = y_hat.argmax(D::Minus1)?.eq(&y_gt)?.to_dtype(INT_DTYPE)?;
+
+        let misses =
+            Tensor::zeros_like(&y_gt)?.affine(0.0, (model.config.vocab_size + 1) as f64)?;
+
+        let mut acc_hits_by_id: BTreeSet<u32> = acc_scores
+            .where_cond(&y_gt, &misses)?
+            .to_dtype(INT_DTYPE)?
+            .flatten_all()?
+            .to_vec1()?
+            .into_iter()
+            .collect();
+
+        total_loss = total_loss.add(&loss)?;
+
+        total_acc_scores = total_acc_scores.add(&acc_scores)?;
+
+        total_acc_hits_by_id.append(&mut acc_hits_by_id);
+    }
+
+    total_acc_hits_by_id.remove(&(model.config.vocab_size as u32 + 1));
+
+    Ok((
+        total_loss.to_dtype(DType::F32)?,
+        total_acc_scores.to_dtype(DType::F32)?,
+        total_acc_hits_by_id,
+    ))
 }
 
 fn main() -> Result<()> {
@@ -111,12 +164,13 @@ fn main() -> Result<()> {
         num_blocks: 2,
         ff_dim: 768 * 4,
         is_causal: true,
+        eps: cli.epsilon,
     };
 
     let model = Transformer::new(&cfg, vb, &device)?;
 
     let optim_params = ParamsAdamW {
-        lr: 6e-4,
+        lr: get_lr(0, &cli),
         eps: cli.epsilon,
         weight_decay: 0.1,
         ..Default::default()
@@ -138,22 +192,18 @@ fn main() -> Result<()> {
         .next()
         .expect("Not a single batch could be extracted from dataset");
 
-    let v_batch_tensor = Tensor::from_vec(v_batch, (cli.minibatch_size, cli.ctx_size + 1), &device)?;
-
-    let mut embed_sum = 0.0f64;
-
     for (idx, t_batch) in batch_iter.enumerate() {
-        let t_minibatch_tensor =
-            Tensor::from_vec(t_batch, (cli.minibatch_size, cli.ctx_size + 1), &device)?;
-
-        let (t_loss, t_acc_scores, t_acc_hits_by_id) = t_v_step(&model, &t_minibatch_tensor, cli.epsilon)?;
+	
+        let (t_loss, t_acc_scores, t_acc_hits_by_id) = t_v_step(&model, t_batch.as_slice(), &cli)?;
 
         let t_acc = t_acc_scores.mean_all()?;
 
-        let grad_store = t_loss.backward()?;
+        {
+	    let grad_store = t_loss.backward()?;
 
-        optim.step(&grad_store)?;
-
+            optim.step(&grad_store)?;
+	}
+	
         let t_unique_acc_hit_cnt = t_acc_hits_by_id.len();
 
         let t_acc_hits_decoded = tokenizer
@@ -163,14 +213,10 @@ fn main() -> Result<()> {
             )
             .map_err(|e| anyhow!(e.to_string()))?;
 
-
-	let new_embed_sum: f64 = model.embed.embeddings().to_dtype(DType::F64)?.sum_all()?.to_scalar()?;
-
         info!(
-            "T Step {:6} of {:6} | Delta {:8.4} | T loss {:2.6} | T acc {:1.5} ({:5} of {:6}) | {:5} unique hits: {:?}",
+            "T Step {:6} of {:6} | T loss {:2.6} | T acc {:1.5} ({:5} of {:6}) | {:5} unique hits: {:?}",
             idx + 1,
             cli.n_training_steps,
-	    new_embed_sum - embed_sum,
             t_loss.to_scalar::<f32>()?,
             t_acc.to_scalar::<f32>()?,
             t_acc_scores
@@ -182,10 +228,9 @@ fn main() -> Result<()> {
             t_acc_hits_decoded,
         );
 
-	embed_sum = new_embed_sum;
-
         if idx % cli.val_interval == 0 {
-            let (v_loss, v_acc_scores, v_acc_hits_by_id) = t_v_step(&model, &v_batch_tensor, cli.epsilon)?;
+            let (v_loss, v_acc_scores, v_acc_hits_by_id) =
+                t_v_step(&model, v_batch.as_slice(), &cli)?;
 
             let v_acc = v_acc_scores.mean_all()?;
 
@@ -199,7 +244,7 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow!(e.to_string()))?;
 
             info!(
-            "V Step {:6} of {:6} | V loss {:2.4} | V acc {:1.5} ({:5} of {:6}) | {:5} unique hits: {:?}",
+                "V Step {:6} of {:6} | V loss {:2.4} | V acc {:1.5} ({:5} of {:6}) | {:5} unique hits: {:?}",
                 idx + 1,
                 cli.n_training_steps,
                 v_loss.to_scalar::<f32>()?,
@@ -213,6 +258,8 @@ fn main() -> Result<()> {
                 v_acc_hits_decoded,
             );
         }
+
+	optim.set_learning_rate(get_lr(idx, &cli));
     }
 
     Ok(())

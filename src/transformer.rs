@@ -1,13 +1,12 @@
 use core::f64;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, Tensor};
-use candle_flash_attn::flash_attn;
 use candle_nn::{
-    self as nn, Embedding, LayerNorm, LayerNormConfig, Linear, Module, Sequential, VarBuilder,
+    self as nn, Embedding, LayerNorm, LayerNormConfig, Linear, Module, Sequential, VarBuilder, init,
 };
 
-use crate::num_helpers::check_nan_and_inf;
+use crate::{my_ops, num_helpers::check_nan_and_inf};
 
 pub const FLOAT_DTYPE: DType = DType::BF16;
 pub const INT_DTYPE: DType = DType::U32;
@@ -21,6 +20,7 @@ pub struct TransformerConfig {
     pub num_blocks: usize,
     pub ff_dim: usize,
     pub is_causal: bool,
+    pub eps: f64,
 }
 
 pub struct Transformer {
@@ -37,15 +37,18 @@ impl Transformer {
         for i in 0..cfg.num_blocks {
             blocks = blocks.add(TBlock::new(cfg, vb.pp(format!("block{}", i)), dev)?);
         }
-	let w_embed_unembed = vb.get_with_hints(
-		(cfg.vocab_size, cfg.embed_dim),
-		"w_embed_unembed",
-		nn::init::DEFAULT_KAIMING_UNIFORM,
-	    )?;
+        let w_embed_unembed = vb.get_with_hints(
+            (cfg.vocab_size, cfg.embed_dim),
+            "w_embed_unembed",
+            nn::init::Init::Randn {
+                mean: 0.0,
+                stdev: 0.02 / (2.0 * cfg.num_blocks as f64).sqrt(),
+            },
+        )?;
 
-	let embed = Embedding::new(w_embed_unembed, cfg.embed_dim);
+        let embed = Embedding::new(w_embed_unembed, cfg.embed_dim);
 
-	check_nan_and_inf(embed.embeddings(), "embed init")?;
+        check_nan_and_inf(embed.embeddings(), "embed init")?;
 
         Ok(Self {
             config: cfg.clone(),
@@ -64,25 +67,23 @@ impl Module for Transformer {
     fn forward(&self, xs: &Tensor) -> Result<Tensor, candle_core::Error> {
         let x_embed = self.embed.forward(xs)?;
 
-	check_nan_and_inf(&x_embed, "model x_embed")?;
+        check_nan_and_inf(&x_embed, "model x_embed")?;
 
         let x_pos_embed = x_embed.add(&self.pos_embed.expand(x_embed.shape())?)?;
 
-	check_nan_and_inf(&x_pos_embed, "model x_pos_embed")?;
+        check_nan_and_inf(&x_pos_embed, "model x_pos_embed")?;
 
         let x_blocks = self.blocks.forward(&x_pos_embed)?;
 
-	check_nan_and_inf(&x_blocks, "model x_blocks")?;
+        check_nan_and_inf(&x_blocks, "model x_blocks")?;
 
         let x_unembed = x_blocks.broadcast_matmul(&self.embed.embeddings().t()?)?;
 
-	check_nan_and_inf(&x_unembed, "model x_unembed")?;
+        check_nan_and_inf(&x_unembed, "model x_unembed")?;
 
-        let x_out = nn::ops::softmax(&x_unembed, D::Minus1)?;
+        check_nan_and_inf(&x_unembed, "model x_out")?;
 
-	check_nan_and_inf(&x_out, "model x_out")?;
-
-        Ok(x_out)
+        Ok(x_unembed)
     }
 }
 
@@ -97,37 +98,50 @@ pub struct TBlock {
 
 impl TBlock {
     pub fn new(cfg: &TransformerConfig, vb: VarBuilder, dev: &Device) -> Result<Self> {
-        Ok(Self {
+        let new_self = Self {
             config: cfg.clone(),
             ln1: nn::layer_norm(cfg.embed_dim, LayerNormConfig::default(), vb.pp("ln1"))?,
             atn: MHSA::new(cfg, vb.pp("atn"), dev)?,
             ln2: nn::layer_norm(cfg.embed_dim, LayerNormConfig::default(), vb.pp("ln2"))?,
             ff1: nn::linear(cfg.embed_dim, cfg.ff_dim, vb.pp("ff1"))?,
-            ff2: nn::linear(cfg.ff_dim, cfg.embed_dim, vb.pp("ff2"))?,
-        })
+            ff2: Linear::new(
+                vb.get_with_hints(
+                    (cfg.embed_dim, cfg.ff_dim),
+                    "ff2.weight",
+                    init::Init::Randn {
+                        mean: 0.0f64,
+                        stdev: 0.02 / (2.0 * cfg.num_blocks as f64).sqrt(),
+                    },
+                )?,
+                None,
+            ),
+        };
+
+        Ok(new_self)
     }
 }
 
 impl Module for TBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor, candle_core::Error> {
-        let x_ln1 = self.ln1.forward(xs)?;
-	check_nan_and_inf(&x_ln1, "x_ln1")?;
+        let x_ln1 = xs;
+        // let x_ln1 = self.ln1.forward(xs)?;
+        // check_nan_and_inf(&x_ln1, "x_ln1")?;
 
-        let x_atn = self.atn.forward(&x_ln1)?;
-	check_nan_and_inf(&x_atn, "x_atn")?;
+        let x_atn = self.atn.forward(x_ln1)?;
+        check_nan_and_inf(&x_atn, "x_atn")?;
 
         let xs_with_atn = (xs + x_atn)?;
-	check_nan_and_inf(&xs_with_atn, "xs_with_atn")?;
+        check_nan_and_inf(&xs_with_atn, "xs_with_atn")?;
 
-        let x_ln2 = self.ln2.forward(&xs_with_atn)?;
-	check_nan_and_inf(&x_ln2, "x_ln2")?;
+        let x_ln2 = &xs_with_atn;
+        // let x_ln2 = self.ln2.forward(&xs_with_atn)?;
+        // check_nan_and_inf(&x_ln2, "x_ln2")?;
 
-        let x_ff1 = self.ff1.forward(&x_ln2)?.gelu()?;
-	check_nan_and_inf(&x_ff1, "x_ff1")?;
+        let x_ff1 = self.ff1.forward(x_ln2)?.gelu()?;
+        check_nan_and_inf(&x_ff1, "x_ff1")?;
 
         let x_ff2 = self.ff2.forward(&x_ff1)?;
-	check_nan_and_inf(&x_ff2, "x_ff2")?;
-
+        check_nan_and_inf(&x_ff2, "x_ff2")?;
 
         Ok((xs_with_atn + x_ff2)?)
     }
@@ -155,10 +169,11 @@ impl MHSA {
         let zeros = Tensor::zeros((cfg.ctx_size, cfg.ctx_size), FLOAT_DTYPE, dev)?;
 
         let mask = if cfg.is_causal {
-            let infinities = Tensor::full(f64::NEG_INFINITY, zeros.shape(), dev)?.to_dtype(FLOAT_DTYPE)?;
+            let infinities =
+                Tensor::full(f64::NEG_INFINITY, zeros.shape(), dev)?.to_dtype(FLOAT_DTYPE)?;
 
             Tensor::tril2(cfg.ctx_size, INT_DTYPE, dev)?
-                .where_cond(&infinities, &zeros)?
+                .where_cond(&zeros, &infinities)?
                 .to_dtype(FLOAT_DTYPE)?
         } else {
             zeros
@@ -190,6 +205,8 @@ impl Module for MHSA {
             .transpose(1, 2)?
             .contiguous()?;
 
+        check_nan_and_inf(&x_q, "x_q")?;
+
         let x_k = x_qkv_chunks[1]
             .reshape((
                 xs_shape[0],
@@ -199,6 +216,8 @@ impl Module for MHSA {
             ))?
             .transpose(1, 2)?
             .contiguous()?;
+
+        check_nan_and_inf(&x_k, "x_k")?;
 
         let x_v = x_qkv_chunks[2]
             .reshape((
@@ -210,13 +229,25 @@ impl Module for MHSA {
             .transpose(1, 2)?
             .contiguous()?;
 
+        check_nan_and_inf(&x_v, "x_v")?;
+
         let xqxk = x_q.matmul(&x_k.t()?)?;
 
-        let xqxk_masked = xqxk.broadcast_add(&self.mask)?;
+        let mask_expanded = self.mask.expand(xqxk.shape())?;
+
+        let xqxk_masked = mask_expanded
+            .ne(&Tensor::zeros_like(&mask_expanded)?)?
+            .where_cond(&mask_expanded, &xqxk)?;
 
         let xqxk_scaled = xqxk_masked.affine(1.0 / (self.head_size as f64).sqrt(), 0.0)?;
 
-        let x_atn = nn::ops::softmax_last_dim(&xqxk_scaled)?.matmul(&x_v)?;
+        let x_softmax = my_ops::softmax(&xqxk_scaled, D::Minus1, self.config.eps)?;
+
+        check_nan_and_inf(&x_softmax, "x_softmax")?;
+
+        let x_atn = x_softmax.matmul(&x_v)?;
+
+        check_nan_and_inf(&x_atn, "x_atn")?;
 
         let x_atn_reshaped = x_atn.transpose(1, 2)?.reshape(xs_shape)?;
 
